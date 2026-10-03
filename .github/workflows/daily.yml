@@ -1,6 +1,6 @@
 name: daily-weather
 on:
-   schedule:
+  schedule:
     - cron: "0 12 * * *"      # morning: 7:00 AM Central (daylight time)
     - cron: "0 23 * * *"      # evening: 6:00 PM Central (daylight time)
   workflow_dispatch: {}        # adds a manual "Run workflow" button
