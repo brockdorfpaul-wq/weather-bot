@@ -22,12 +22,15 @@ try:
         info = json.load(f)
 except Exception:
     info = {}
-FIELDS = ["date", "video_id", "mode", "format", "location", "voice", "hook",
-          "title_style", "script_source", "title"]
-is_new = not os.path.exists("video_log.csv")
-with open("video_log.csv", "a", newline="", encoding="utf-8") as f:
+FIELDS = ["date", "video_id", "mode", "format", "location", "voice", "voice_used", "hook",
+          "title_style", "script_source", "title", "story", "score", "event"]
+rows = []
+if os.path.exists("video_log.csv"):
+    with open("video_log.csv", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+rows.append({**info, "video_id": video_id, "title": title[:95]})
+with open("video_log.csv", "w", newline="", encoding="utf-8") as f:   # rewriting keeps the columns up to date
     w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
-    if is_new:
-        w.writeheader()
-    w.writerow({**info, "video_id": video_id, "title": title[:95]})
+    w.writeheader()
+    w.writerows(rows)
 print("Logged in video_log.csv")
