@@ -1,7 +1,7 @@
-import os, re, json, random, asyncio, subprocess, textwrap, requests
+import os, re, json, math, random, asyncio, subprocess, textwrap, requests
 from collections import Counter
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import edge_tts
 
 # ---------- SETTINGS: edit these ----------
@@ -601,12 +601,7 @@ def overview_template(total, top):
 
 
 def overview_colors(event):
-    t = event.lower()
-    if any(k in t for k in ("winter", "snow", "ice", "freez", "blizzard", "frost", "wind chill")):
-        return (120, 150, 190), (220, 230, 245)
-    if any(k in t for k in ("heat", "fire", "red flag")): return (200, 70, 30), (250, 160, 60)
-    if any(k in t for k in ("tornado", "thunder", "flood", "storm", "hurricane")): return (30, 40, 70), (80, 90, 120)
-    return (60, 110, 180), (150, 190, 230)
+    return weather_kind(event)
 
 
 # ---------- titles and hashtags ----------
@@ -693,13 +688,58 @@ def make_script(facts, fallback, style):
     return fallback
 
 
-# ---------- drawing ----------
+# ---------- drawing: animated, branded AtmosSquall style ----------
+FPS = 30
+BRAND_NAVY = (14, 22, 52)
+BRAND_CYAN = (70, 200, 255)
+BRAND_BLUE = (45, 120, 225)
+BRAND_PURPLE = (125, 70, 185)
+BRAND_GOLD = (255, 215, 120)
+LOGO_PATH = "logo.png"
+
+
+def weather_kind(text):
+    """Turns forecast or alert wording into one of a few animated sky styles."""
+    t = (text or "").lower()
+    if any(k in t for k in ("thunder", "tornado", "storm", "hurricane", "severe", "tropical")):
+        return "storm"
+    if any(k in t for k in ("snow", "flurr", "blizzard", "sleet", "ice", "freez", "winter", "cold", "frost")):
+        return "snow"
+    if any(k in t for k in ("rain", "shower", "drizzle", "flood")):
+        return "rain"
+    if any(k in t for k in ("fog", "haze", "smoke", "mist")):
+        return "fog"
+    if any(k in t for k in ("sunny", "clear", "heat", "fire", "red flag", "hot")):
+        return "clear"
+    return "cloudy"
+
+
 def colors_for(text):
-    t = text.lower()
-    if any(k in t for k in ("snow", "flurr", "ice", "blizzard")): return (120, 150, 190), (220, 230, 245)
-    if any(k in t for k in ("storm", "thunder", "rain", "shower")): return (30, 40, 70), (80, 90, 120)
-    if "sunny" in t or "clear" in t: return (255, 140, 40), (60, 140, 220)
-    return (60, 110, 180), (150, 190, 230)
+    return weather_kind(text)
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def ease(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+
+def ease_out_back(t):
+    t = max(0.0, min(1.0, t))
+    c = 1.7
+    return 1 + (c + 1) * (t - 1) ** 3 + c * (t - 1) ** 2
+
+
+def mix(c1, c2, t):
+    t = max(0.0, min(1.0, t))
+    return tuple(int(lerp(c1[i], c2[i], t)) for i in range(3))
+
+
+def shade(c, f):
+    return tuple(max(0, min(255, int(v * f))) for v in c)
 
 
 FONT_CANDIDATES = [
@@ -707,13 +747,19 @@ FONT_CANDIDATES = [
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",        # Mac
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",     # Linux / GitHub Actions
 ]
+_font_cache, _sprite_cache, _bg_cache = {}, {}, {}
+CUR = {"img": None}
 
 
 def font(size):
-    for p in FONT_CANDIDATES:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
-    return ImageFont.load_default()
+    if size not in _font_cache:
+        f = None
+        for p in FONT_CANDIDATES:
+            if os.path.exists(p):
+                f = ImageFont.truetype(p, size)
+                break
+        _font_cache[size] = f or ImageFont.load_default()
+    return _font_cache[size]
 
 
 def fit_font(d, text, max_w, size):
@@ -722,90 +768,339 @@ def fit_font(d, text, max_w, size):
     return font(size)
 
 
-def gradient(d, cols):
-    for y in range(H):
-        t = y / H
-        d.line([(0, y), (W, y)], fill=tuple(int(cols[0][i] * (1 - t) + cols[1][i] * t) for i in range(3)))
+def cached(key, make):
+    if key not in _sprite_cache:
+        if len(_sprite_cache) > 500:
+            _sprite_cache.clear()
+        _sprite_cache[key] = make()
+    return _sprite_cache[key]
 
 
-def draw_caption(d, caption):
-    y = 1540
-    for line in textwrap.wrap(caption, 26)[:3]:
-        d.text((W / 2, y), line, font=font(64), fill="white", anchor="mm", stroke_width=4, stroke_fill="black")
-        y += 88
+def paste(sprite, x, y):
+    if sprite is not None:
+        CUR["img"].paste(sprite, (int(x), int(y)), sprite)
 
 
-def draw_label(d, text, color, y, size):
-    if text:
-        d.text((W / 2, y), text, font=fit_font(d, text, 980, size), fill=color, anchor="mm",
-               stroke_width=3, stroke_fill="black")
+def gradient_bg(top, bottom):
+    key = (top, bottom)
+    if key not in _bg_cache:
+        img = Image.new("RGB", (W, H))
+        d = ImageDraw.Draw(img)
+        for y in range(H):
+            d.line([(0, y), (W, y)], fill=mix(top, bottom, y / H))
+        _bg_cache[key] = img
+    return _bg_cache[key].copy()
 
 
-def draw_chips(d, chips, top, step, height):
-    for i, (text, outline) in enumerate(chips):
+def sphere_sprite(r, light, dark):
+    r = max(3, int(r))
+
+    def make():
+        size = 2 * r
+        g = Image.radial_gradient("L").resize((int(size * 1.6), int(size * 1.6)))
+        x0, y0 = int(size * 0.45), int(size * 0.5)
+        g = g.crop((x0, y0, x0 + size, y0 + size))
+        col = Image.composite(Image.new("RGB", (size, size), dark), Image.new("RGB", (size, size), light), g)
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse([1, 1, size - 2, size - 2], fill=255)
+        out = col.convert("RGBA")
+        out.putalpha(mask.filter(ImageFilter.GaussianBlur(1.2)))
+        return out
+    return cached(("sphere", r, light, dark), make)
+
+
+def glow_sprite(r, color, strength=170):
+    r = max(4, int(r))
+
+    def make():
+        g = Image.radial_gradient("L").resize((2 * r, 2 * r))
+        out = Image.new("RGBA", (2 * r, 2 * r), color + (0,))
+        out.putalpha(g.point(lambda v: int(strength * max(0.0, 1 - v / 255) ** 2)))
+        return out
+    return cached(("glow", r, color, strength), make)
+
+
+def soft_band(w, h, color, alpha, blur):
+    def make():
+        pad = int(blur * 3)
+        m = Image.new("L", (w + 2 * pad, h + 2 * pad), 0)
+        ImageDraw.Draw(m).ellipse([pad, pad, pad + w, pad + h], fill=alpha)
+        out = Image.new("RGBA", m.size, color + (0,))
+        out.putalpha(m.filter(ImageFilter.GaussianBlur(blur)))
+        return out
+    return cached(("band", w, h, color, alpha, blur), make)
+
+
+PUFFS = [(5, 30, 58), (-70, 18, 50), (85, 18, 45), (40, -12, 60), (-25, -25, 65)]
+
+
+def cloud_sprite(s, fill):
+    s = max(0.05, round(s * 20) / 20)
+
+    def make():
+        dark = shade(fill, 0.64)
+        w, h = int(360 * s) + 24, int(230 * s) + 24
+        canvas = Image.new("RGBA", (w, h), fill + (0,))
+        ox, oy = w / 2, h / 2 + 10 * s
+        for dx, dy, r in PUFFS:
+            sp = sphere_sprite(r * s, fill, dark)
+            canvas.alpha_composite(sp, (int(ox + dx * s - sp.width / 2), int(oy + dy * s - sp.height / 2)))
+        return canvas.filter(ImageFilter.GaussianBlur(max(0.6, 1.6 * s)))
+    return cached(("cloud", s, fill), make)
+
+
+def cloud(x, y, s, fill):
+    sp = cloud_sprite(s, fill)
+    paste(sp, x - sp.width / 2, y - sp.height / 2)
+
+
+def logo_sprite(size):
+    def make():
+        try:
+            return Image.open(LOGO_PATH).convert("RGBA").resize((size, size), Image.LANCZOS)
+        except Exception:
+            return None
+    return cached(("logo", size), make)
+
+
+# ---------- animated skies ----------
+DAY_SKIES = {"clear": ((60, 140, 230), (185, 222, 250)), "cloudy": ((100, 130, 172), (196, 208, 226)),
+             "rain": ((52, 68, 100), (132, 146, 170)), "storm": ((24, 26, 56), (88, 70, 128)),
+             "snow": ((130, 158, 198), (226, 233, 244)), "fog": ((140, 150, 166), (212, 217, 224))}
+NIGHT_SKIES = {"clear": ((6, 12, 36), (38, 50, 98)), "cloudy": ((16, 22, 46), (60, 66, 98)),
+               "rain": ((12, 16, 34), (50, 56, 82)), "storm": ((10, 8, 28), (62, 40, 100)),
+               "snow": ((26, 36, 66), (92, 104, 138)), "fog": ((26, 30, 46), (80, 86, 102))}
+BRAND_SKY = ((10, 16, 44), (74, 40, 122))
+CLOUD_SETUPS = {"clear": 2, "cloudy": 6, "rain": 7, "storm": 7, "snow": 6, "fog": 4, "brand": 4}
+
+
+def draw_sky(img, d, t, kind, night=False, brand=False):
+    if brand:
+        img.paste(gradient_bg(*BRAND_SKY))
+    else:
+        img.paste(gradient_bg(*(NIGHT_SKIES if night else DAY_SKIES)[kind]))
+    rnd = random.Random(42)
+    if night or brand:
+        for _ in range(90):
+            x, y, z = rnd.randint(0, W), rnd.randint(0, 1200), rnd.random()
+            r = 1 + 2.2 * z * (0.6 + 0.4 * math.sin(t * 3 + x))
+            d.ellipse([x - r, y - r, x + r, y + r], fill=(225, 230, 255))
+    if kind == "clear" and not brand:
+        cx, cy = (860, 300) if not night else (880, 280)
+        g = glow_sprite(330, (255, 225, 140) if not night else (220, 225, 255), 150 if not night else 90)
+        paste(g, cx - 330, cy - 330)
+        if not night:
+            for k in range(12):
+                a = k * math.pi / 6 + t * 0.35
+                d.line([(cx + math.cos(a) * 125, cy + math.sin(a) * 125),
+                        (cx + math.cos(a) * 175, cy + math.sin(a) * 175)], fill=(255, 210, 70), width=10)
+            paste(sphere_sprite(105, (255, 246, 175), (250, 165, 30)), cx - 105, cy - 105)
+        else:
+            paste(sphere_sprite(80, (250, 250, 238), (175, 178, 165)), cx - 80, cy - 80)
+    n = CLOUD_SETUPS["brand" if brand else kind]
+    if brand:
+        fill = (70, 64, 128)
+    elif night:
+        fill = {"storm": (70, 66, 100), "rain": (82, 88, 112)}.get(kind, (104, 112, 140))
+    else:
+        fill = {"storm": (112, 112, 140), "rain": (150, 158, 176), "snow": (226, 232, 242),
+                "fog": (205, 210, 218)}.get(kind, (246, 248, 252))
+    for k in range(n):
+        depth = rnd.uniform(0.6, 1.4)
+        y = rnd.choice([150, 330, 520, 640, 1520, 1700, 1820]) + rnd.uniform(-50, 50)
+        speed = 22 * depth
+        x = (rnd.uniform(0, W + 600) + t * speed) % (W + 600) - 300
+        cloud(x, y, 1.15 * depth, shade(fill, lerp(0.92, 1.05, depth - 0.6)))
+    if kind in ("rain", "storm") and not brand:
+        for _ in range(170 if kind == "storm" else 120):
+            x, off, z = rnd.uniform(-100, W), rnd.random(), rnd.uniform(0.35, 1.0)
+            y = ((off + t * (0.8 + 0.9 * z)) % 1) * H
+            ln = 26 + 44 * z
+            d.line([(x, y), (x - 0.25 * ln, y + ln)], fill=mix((120, 135, 165), (195, 215, 245), z), width=int(2 + 3 * z))
+    if kind == "snow" and not brand:
+        for _ in range(140):
+            x, off, z = rnd.uniform(0, W), rnd.random(), rnd.uniform(0.3, 1.0)
+            y = ((off + t * (0.07 + 0.12 * z)) % 1) * H
+            x += math.sin(t * 1.8 + off * 9) * 18 * z
+            r = 3 + 7 * z
+            d.ellipse([x - r, y - r, x + r, y + r], fill=mix((205, 214, 232), (255, 255, 255), z))
+    if kind == "fog" and not brand:
+        for k in range(5):
+            band = soft_band(1500, 130, (225, 228, 235), 150, 22)
+            x = ((k * 420 + t * (20 + 6 * k)) % (W + 1500)) - 1500
+            for y in (520 + k * 40, 1500 + k * 50):
+                paste(band, x, y)
+    if kind == "storm" and not brand and (t + 0.6) % 3.4 < 0.16:
+        bx = 180 + int(t * 37) % 700
+        pts, x, y = [], bx, 0
+        r2 = random.Random(int(t * 3))
+        while y < 620:
+            pts.append((x, y))
+            x += r2.randint(-60, 60)
+            y += 55
+        paste(glow_sprite(260, (230, 220, 255), 160), bx - 260, 60)
+        d.line(pts, fill=(235, 225, 255), width=14)
+        d.line(pts, fill=(255, 255, 255), width=5)
+        CUR["flash"] = True
+
+
+def finish_frame(img):
+    if CUR.get("flash"):
+        img.paste(Image.blend(img, Image.new("RGB", (W, H), (255, 255, 255)), 0.22))
+        CUR["flash"] = False
+
+
+# ---------- branded overlay pieces ----------
+def draw_brand(img, d, t):
+    """Logo and channel name across the top, with a sliding accent line."""
+    lg = logo_sprite(104)
+    x = 30
+    if lg is not None:
+        paste(glow_sprite(80, BRAND_CYAN, 110), 26 + 52 - 80, 14 + 52 - 80)
+        paste(lg, 26, 14)
+        x = 146
+    d.text((x, 66), "AtmosSquall", font=font(46), fill="white", anchor="lm", stroke_width=4, stroke_fill=BRAND_NAVY)
+    w = d.textlength("AtmosSquall", font=font(46))
+    s = ease(t / 0.8)
+    d.line([(x, 98), (x + w * s, 98)], fill=mix(BRAND_CYAN, BRAND_PURPLE, (math.sin(t * 1.5) + 1) / 2), width=5)
+
+
+def text(d, xy, s, size, fill="white", stroke=5, max_w=980, anchor="mm"):
+    d.text(xy, s, font=fit_font(d, s, max_w, size), fill=fill, anchor=anchor, stroke_width=stroke, stroke_fill=(8, 12, 30))
+
+
+def count_up(big, t):
+    """Big numbers count up from zero during the first second; '72°' becomes 0°, 14°, ... 72°."""
+    m = re.match(r"^(-?\d+)(.*)$", big)
+    if not m:
+        return big
+    target, rest = int(m.group(1)), m.group(2)
+    return f"{int(round(target * ease(t / 0.9)))}{rest}"
+
+
+def big_number(d, x, y, big, t, size):
+    s = ease_out_back(t / 0.6)
+    size = max(24, int(size * (0.55 + 0.45 * s)))
+    d.text((x, y), count_up(big, t), font=font(size), fill="white", anchor="mm", stroke_width=7, stroke_fill=(8, 12, 30))
+
+
+def radar_frame(d, t, box):
+    x0, y0, x1, y1 = box
+    glow = mix(BRAND_CYAN, BRAND_PURPLE, (math.sin(t * 1.6) + 1) / 2)
+    d.rounded_rectangle([x0 - 10, y0 - 10, x1 + 10, y1 + 10], radius=40, fill=shade(glow, 0.45))
+    d.rounded_rectangle([x0 - 5, y0 - 5, x1 + 5, y1 + 5], radius=36, fill=glow)
+    d.rounded_rectangle([x0, y0, x1, y1], radius=30, fill=(10, 12, 26))
+
+
+def chips(d, t, items, top, step, height):
+    for i, (label, outline) in enumerate(items):
+        a = ease((t - 0.6 - i * 0.35) / 0.4)
+        if a <= 0:
+            continue
         y0 = top + i * step
-        d.rounded_rectangle([90, y0, 990, y0 + height], radius=24, fill=(18, 18, 44), outline=outline, width=4)
-        d.text((W / 2, y0 + height / 2), text, font=fit_font(d, text, 840, 46), fill="white", anchor="mm")
+        dx = (1 - a) * 700
+        d.rounded_rectangle([98 + dx, y0 + 8, 998 + dx, y0 + height + 8], radius=24, fill=(4, 6, 16))
+        d.rounded_rectangle([90 + dx, y0, 990 + dx, y0 + height], radius=24, fill=(16, 18, 44), outline=outline, width=5)
+        d.text((W / 2 + dx, y0 + height / 2), label, font=fit_font(d, label, 840, 46), fill="white", anchor="mm")
 
 
-def make_frame(path, big, sub, caption, cols, has_radar, label, label_color):
+def draw_caption(d, caption, ct):
+    """Captions pop up line by line as they're spoken."""
+    a = ease(ct / 0.25)
+    for width, size, gap, most in ((24, 66, 92, 3), (28, 58, 80, 4), (33, 50, 68, 5)):
+        lines = textwrap.wrap(caption, width)
+        if len(lines) <= most:
+            break
+    y = 1560 + (1 - a) * 40
+    for line in lines[:most]:
+        d.text((W / 2, y), line, font=font(size), fill="white" if a > 0.5 else (200, 205, 220), anchor="mm",
+               stroke_width=6, stroke_fill=(8, 12, 30))
+        y += gap
+
+
+# ---------- the three video looks ----------
+def make_frame(t, ct, big, sub, caption, kind, has_radar, label, label_color, night=False):
     """Morning / overview look: location, story label, big number, radar below."""
     img = Image.new("RGB", (W, H))
     d = ImageDraw.Draw(img)
-    gradient(d, cols)
-    d.text((W / 2, 130), REGION, font=fit_font(d, REGION, 980, 66), fill="white", anchor="mm")
-    draw_label(d, label, label_color, 220, 46)
-    d.text((W / 2, 395), big, font=font(210), fill="white", anchor="mm")
-    d.text((W / 2, 550), sub, font=fit_font(d, sub, 980, 56), fill="white", anchor="mm")
+    CUR["img"], CUR["flash"] = img, False
+    draw_sky(img, d, t, kind, night=night)
+    draw_brand(img, d, t)
+    text(d, (W / 2, 175), REGION, 64)
+    if label:
+        pulse = 0.5 + 0.5 * math.sin(t * 3)
+        lw = d.textlength(label, font=fit_font(d, label, 980, 44))
+        paste(glow_sprite(int(lw / 2 + 60), label_color, int(70 + 60 * pulse)), W / 2 - (lw / 2 + 60), 250 - (lw / 2 + 60))
+        text(d, (W / 2, 250), label, 44, fill=label_color, stroke=4)
+    big_number(d, W / 2, 405, big, t, 200)
+    text(d, (W / 2, 560), sub, 54)
     if has_radar:
-        d.rounded_rectangle([90, 620, 990, 1470], radius=30, fill=(15, 15, 25))
-    draw_caption(d, caption)
-    img.save(path)
+        radar_frame(d, t, (90, 620, 990, 1470))
+    draw_caption(d, caption, ct)
+    finish_frame(img)
+    return img
 
 
-def make_frame_evening(path, info, caption, has_radar, label, label_color):
-    """Evening look: night colors, story label, tomorrow's high, two info chips, smaller radar."""
+def make_frame_evening(t, ct, info, caption, has_radar, label, label_color):
+    """Evening look: night sky, story label, tomorrow's high, two info chips, smaller radar."""
     img = Image.new("RGB", (W, H))
     d = ImageDraw.Draw(img)
-    gradient(d, ((20, 24, 62), (78, 52, 120)))
+    CUR["img"], CUR["flash"] = img, False
     m = info["tomorrow"]
-    d.text((W / 2, 105), REGION, font=fit_font(d, REGION, 980, 62), fill="white", anchor="mm")
-    draw_label(d, label, label_color, 175, 42)
-    d.text((W / 2, 250), "TOMORROW'S HIGH", font=font(40), fill=(255, 215, 120), anchor="mm")
-    d.text((W / 2, 395), f"{m['temperature']}\u00b0", font=font(190), fill="white", anchor="mm")
-    sub = textwrap.shorten(m["shortForecast"], 34, placeholder="...")
-    d.text((W / 2, 530), sub, font=fit_font(d, sub, 980, 50), fill="white", anchor="mm")
-    draw_chips(d, [(info["chip1"], (255, 215, 0)), (info["chip2"], (120, 200, 255))], 620, 100, 82)
+    draw_sky(img, d, t, weather_kind(m["shortForecast"]), night=True)
+    draw_brand(img, d, t)
+    text(d, (W / 2, 160), REGION, 58)
+    if label:
+        text(d, (W / 2, 220), label, 40, fill=label_color, stroke=4)
+    text(d, (W / 2, 272), "TOMORROW'S HIGH", 38, fill=BRAND_GOLD, stroke=3)
+    big_number(d, W / 2, 400, f"{m['temperature']}\u00b0", t, 175)
+    text(d, (W / 2, 535), textwrap.shorten(m["shortForecast"], 34, placeholder="..."), 48)
+    chips(d, t, [(info["chip1"], BRAND_GOLD), (info["chip2"], BRAND_CYAN)], 620, 100, 82)
     if has_radar:
-        d.rounded_rectangle([90, 830, 990, 1470], radius=30, fill=(12, 12, 28))
-    draw_caption(d, caption)
-    img.save(path)
+        radar_frame(d, t, (90, 830, 990, 1470))
+    draw_caption(d, caption, ct)
+    finish_frame(img)
+    return img
 
 
-def make_frame_showdown(path, sd, caption, has_radar, label, label_color, day_word):
-    """Quiet-day look: hottest vs coldest big city, rain/snow cities, national radar."""
+def make_frame_showdown(t, ct, sd, caption, has_radar, label, label_color, day_word):
+    """Quiet-day look: brand-colored sky, hottest vs coldest big city, rain/snow cities, national radar."""
     img = Image.new("RGB", (W, H))
     d = ImageDraw.Draw(img)
-    gradient(d, ((28, 36, 84), (120, 70, 140)))
+    CUR["img"], CUR["flash"] = img, False
+    draw_sky(img, d, t, "cloudy", brand=True)
+    draw_brand(img, d, t)
     h, c = sd["hot"], sd["cold"]
-    d.text((W / 2, 105), "United States", font=font(62), fill="white", anchor="mm")
-    draw_label(d, label, label_color, 175, 42)
-    d.text((W / 2, 250), f"HOTTEST VS COLDEST {day_word.upper()}", font=fit_font(d, "HOTTEST VS COLDEST TOMORROW", 980, 40),
-           fill=(255, 215, 120), anchor="mm")
-    d.text((W / 2, 395), f"{sd['gap']}\u00b0", font=font(190), fill="white", anchor="mm")
-    sub = f"{h['city']} vs {c['city']}"
-    d.text((W / 2, 530), sub, font=fit_font(d, sub, 980, 50), fill="white", anchor="mm")
+    text(d, (W / 2, 160), "United States", 58)
+    if label:
+        text(d, (W / 2, 220), label, 40, fill=label_color, stroke=4)
+    text(d, (W / 2, 272), f"HOTTEST VS COLDEST {day_word.upper()}", 38, fill=BRAND_GOLD, stroke=3)
+    big_number(d, W / 2, 400, f"{sd['gap']}\u00b0", t, 175)
+    text(d, (W / 2, 535), f"{h['city']} vs {c['city']}", 48)
     if sd["wet"]:
         wet = "RAIN/SNOW: " + ", ".join(f"{r['city']} {r['pop']}%" for r in sd["wet"][:2])
     else:
         wet = "DRY: no big-city rain or snow likely"
-    draw_chips(d, [(f"HOTTEST: {h['city']} {h['temp']}\u00b0", (255, 150, 60)),
-                   (f"COLDEST: {c['city']} {c['temp']}\u00b0", (120, 200, 255)),
-                   (wet, (170, 255, 170))], 620, 95, 80)
+    chips(d, t, [(f"HOTTEST: {h['city']} {h['temp']}\u00b0", (255, 150, 60)),
+                 (f"COLDEST: {c['city']} {c['temp']}\u00b0", BRAND_CYAN),
+                 (wet, (170, 255, 170))], 620, 95, 80)
     if has_radar:
-        d.rounded_rectangle([90, 915, 990, 1470], radius=30, fill=(12, 12, 28))
-    draw_caption(d, caption)
-    img.save(path)
+        radar_frame(d, t, (90, 915, 990, 1470))
+    draw_caption(d, caption, ct)
+    finish_frame(img)
+    return img
+
+
+def render_video(frame_at, seconds, out_path):
+    """Draws every frame and streams it straight into FFmpeg."""
+    proc = subprocess.Popen(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                             "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-preset", "veryfast",
+                             "-crf", "20", "-pix_fmt", "yuv420p", out_path], stdin=subprocess.PIPE)
+    for f in range(max(1, int(round(seconds * FPS)))):
+        proc.stdin.write(frame_at(f / FPS).tobytes())
+    proc.stdin.close()
+    if proc.wait() != 0:
+        raise RuntimeError("ffmpeg failed while drawing the video")
 
 
 def duration(path):
@@ -841,7 +1136,7 @@ def main():
             info = evening_info(periods)
             facts = evening_facts(info, alerts, story)
             lines = make_script(facts, template_evening(info, alerts, story), EVENING_STYLE)
-            draw = lambda path, cap: make_frame_evening(path, info, cap, has_radar, story["label"], story["color"])
+            draw = lambda t, ct, cap: make_frame_evening(t, ct, info, cap, has_radar, story["label"], story["color"])
             radar_filter = ("[1:v]scale=680:600:force_original_aspect_ratio=decrease[r];"
                             "[0:v][r]overlay=(W-w)/2:1150-h/2:shortest=1,format=yuv420p[v]")
         else:
@@ -849,7 +1144,7 @@ def main():
             lines = make_script(facts, template_script(periods, alerts, story), MORNING_STYLE)
             cols = colors_for(periods[0]["shortForecast"])
             big = f"{periods[0]['temperature']}\u00b0"
-            draw = lambda path, cap: make_frame(path, big, periods[0]["shortForecast"], cap, cols,
+            draw = lambda t, ct, cap: make_frame(t, ct, big, periods[0]["shortForecast"], cap, cols,
                                                 has_radar, story["label"], story["color"])
             radar_filter = ("[1:v]scale=860:-2[r];[0:v][r]overlay=(W-w)/2:645:shortest=1,format=yuv420p[v]")
         title = make_title(mode, loc, story, periods)
@@ -864,7 +1159,7 @@ def main():
             print("Showdown:", sd["hot"]["city"], sd["hot"]["temp"], "vs", sd["cold"]["city"], sd["cold"]["temp"])
             facts = showdown_facts(sd, spc_checked, day_word)
             lines = make_script(facts, showdown_template(sd, day_word), SHOWDOWN_STYLE)
-            draw = lambda path, cap: make_frame_showdown(path, sd, cap, has_radar, spc_label, green, day_word)
+            draw = lambda t, ct, cap: make_frame_showdown(t, ct, sd, cap, has_radar, spc_label, green, day_word)
             radar_filter = ("[1:v]scale=860:520:force_original_aspect_ratio=decrease[r];"
                             "[0:v][r]overlay=(W-w)/2:1192-h/2:shortest=1,format=yuv420p[v]")
             title = showdown_title(sd, day_word)
@@ -881,7 +1176,7 @@ def main():
             cols = overview_colors(top[0][0] if top else "")
             big = str(total) if total else "Calm"
             sub = "severe alerts active nationwide" if total else "no severe alerts nationwide"
-            draw = lambda path, cap: make_frame(path, big, sub, cap, cols, has_radar, spc_label, green)
+            draw = lambda t, ct, cap: make_frame(t, ct, big, sub, cap, cols, has_radar, spc_label, green)
             radar_filter = ("[1:v]scale=860:-2[r];[0:v][r]overlay=(W-w)/2:1045-h/2:shortest=1,format=yuv420p[v]")
             title = overview_title(total)
             tags = "#usweather #nationalweather #weather #forecast #shorts"
@@ -892,15 +1187,16 @@ def main():
     clip_len = duration("voice.mp3")
     words = [len(l.split()) for l in lines]
 
-    with open("list.txt", "w", encoding="utf-8") as f:
-        for i, l in enumerate(lines):
-            draw(f"f{i}.png", l)
-            f.write(f"file 'f{i}.png'\nduration {clip_len * words[i] / sum(words):.3f}\n")
-        f.write(f"file 'f{len(lines) - 1}.png'\n")
+    # Step 1: animated sky, branding, numbers and captions (silent)
+    starts, acc = [], 0.0
+    for n in words:
+        starts.append(acc)
+        acc += clip_len * n / sum(words)
 
-    # Step 1: background slides with captions (silent)
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt",
-                    "-vf", "fps=30,format=yuv420p", "-c:v", "libx264", "bg.mp4"], check=True)
+    def frame_at(t):
+        i = max(k for k in range(len(lines)) if starts[k] <= t + 1e-6)
+        return draw(t, t - starts[i], lines[i])
+    render_video(frame_at, clip_len, "bg.mp4")
 
     # Step 2: add radar loop (if available) and the voiceover
     if has_radar:
