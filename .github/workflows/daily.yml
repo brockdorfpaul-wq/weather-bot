@@ -4,9 +4,11 @@ on:
     - cron: "0 12 * * *"      # morning: 7:00 AM Central (daylight time)
     - cron: "0 23 * * *"      # evening: 6:00 PM Central (daylight time)
   workflow_dispatch: {}        # adds a manual "Run workflow" button
+permissions:
+  contents: write              # lets the bot save video_log.csv back to the repo
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +24,14 @@ jobs:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+      - name: Save video log
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add video_log.csv
+          git commit -m "Log new video" || echo "Nothing to save"
+          git pull --rebase
+          git push
       - uses: actions/upload-artifact@v4
         with:
           name: video
