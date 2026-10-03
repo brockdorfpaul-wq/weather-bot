@@ -1,8 +1,10 @@
-import os, re, json, math, random, asyncio, subprocess, textwrap, requests
+import os, re, csv, json, math, random, asyncio, subprocess, textwrap, requests
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import edge_tts
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------- SETTINGS: edit these ----------
 CONTACT = "brockdorf.paul@gmail.com"         # NWS/SPC ask for an identifying User-Agent; use your email
@@ -16,6 +18,11 @@ EXPERIMENTS = {
 TIMEZONE = "America/Chicago"
 EVENING_START_HOUR = 14             # runs at or after 2 PM local time make the evening video
 MIN_STORY_SCORE = 40                # how big a weather story must be to get its own location (see STORY SCORES)
+EVENT_SCORE = 85                    # stories this big (hurricanes, blizzards, ice storms, High risk) get extra updates
+REPEAT_HOURS = 30                   # avoid featuring the same story in the same state this soon, if another is available
+EVENT_COOLDOWN_HOURS = 4            # an extra "big event" update is skipped if that story was posted this recently
+# Gemini models to try in order; if one is retired or busy, the next is used. Check aistudio.google.com for names.
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 NATIONAL_RADAR_URL = "https://radar.weather.gov/ridge/standard/CONUS_loop.gif"
 FALLBACK_RADAR = "KLOT"             # only used if a chosen location somehow has no radar station
 # Big cities compared on quiet days (name, latitude, longitude). Add or remove freely.
@@ -30,9 +37,27 @@ BIG_CITIES = [
 # ------------------------------------------
 
 HDR = {"User-Agent": f"(weatherbot, {CONTACT})"}
+_session = None
+
+
+def http_get(url, **kw):
+    """GET with automatic retries (api.weather.gov often returns brief 5xx errors) and a status check."""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1.5, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=("GET",))
+        _session.mount("https://", HTTPAdapter(max_retries=retry))
+        _session.headers.update(HDR)
+    kw.setdefault("timeout", 30)
+    r = _session.get(url, **kw)
+    r.raise_for_status()
+    return r
+
+
 W, H = 1080, 1920
 CLOSING = "Follow for your daily forecast."
 REGION = "United States"            # reset in main() to the chosen location
+AS_OF = ""                          # "NWS data as of ..." line, set in main()
 HOOK_TEXT = {"question": "Make the very first line a short question that sparks curiosity.",
              "bold": "Make the very first line a short, bold, surprising statement."}
 CURRENT_HOOK = ""                    # set in main() from the chosen hook style
@@ -247,8 +272,7 @@ def alert_story(event, category, score):
 def spc_candidates(day, day_word):
     """Risk areas from the SPC categorical outlook as story candidates."""
     url = f"https://www.spc.noaa.gov/products/outlook/day{day}otlk_cat.lyr.geojson"
-    r = requests.get(url, headers=HDR, timeout=60)
-    r.raise_for_status()
+    r = http_get(url, timeout=60)
     out = []
     for f in r.json().get("features", []):
         props = f.get("properties") or {}
@@ -268,9 +292,7 @@ def spc_candidates(day, day_word):
 def fetch_alerts():
     """All active NWS alerts, or None if the request failed."""
     try:
-        r = requests.get("https://api.weather.gov/alerts/active", params={"status": "actual"},
-                         headers=HDR, timeout=90)
-        r.raise_for_status()
+        r = http_get("https://api.weather.gov/alerts/active", params={"status": "actual"}, timeout=90)
         return r.json()["features"]
     except Exception as e:
         print("Alert download failed:", e)
@@ -285,8 +307,7 @@ def alert_point(feature):
     zones = (feature.get("properties") or {}).get("affectedZones") or []
     if not zones:
         raise ValueError("alert has no area")
-    r = requests.get(zones[len(zones) // 2], headers=HDR, timeout=30)
-    r.raise_for_status()
+    r = http_get(zones[len(zones) // 2])
     pt = biggest_ring_point(r.json().get("geometry"))
     if not pt:
         raise ValueError("zone has no shape")
@@ -313,12 +334,12 @@ def alert_candidates(features):
 
 def locate(lat, lon):
     """Ask the NWS which city, state, forecast and radar belong to a point."""
-    r = requests.get(f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}", headers=HDR, timeout=30)
-    r.raise_for_status()
+    r = http_get(f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}")
     p = r.json()["properties"]
     rl = p["relativeLocation"]["properties"]
     return {"lat": round(lat, 4), "lon": round(lon, 4), "city": rl["city"], "state": rl["state"],
-            "radar": p.get("radarStation") or FALLBACK_RADAR, "forecast": p["forecast"], "story": None}
+            "radar": p.get("radarStation") or FALLBACK_RADAR, "forecast": p["forecast"], "story": None,
+            "tz": p.get("timeZone")}
 
 
 def choose_location(day, day_word, features):
@@ -333,23 +354,58 @@ def choose_location(day, day_word, features):
         print("SPC error:", e)
     cands += alert_candidates(features)
     cands.sort(key=lambda c: (c["score"], c["size"]), reverse=True)
-    for c in cands[:5]:
+    event_only = os.environ.get("EVENT_ONLY") == "1"
+    recent = recent_stories(REPEAT_HOURS)
+    cooling = recent_stories(EVENT_COOLDOWN_HOURS) if event_only else set()
+    repeat = None
+    for c in cands[:6]:
         try:
             lon, lat = c["point"]()
             loc = locate(lat, lon)
             loc["story"] = c["story"]
+            key = (loc["state"], c["story"]["title"])      # same storm, even if the nearest city name shifts
+            if key in cooling:
+                print(f"{key[1]} in {key[0]} was posted in the last {EVENT_COOLDOWN_HOURS} hours; skipping this update")
+                continue
+            if key in recent and c["score"] < EVENT_SCORE and not event_only:
+                print(f"Recently featured {key[1]} in {key[0]}; looking for a different story first")
+                repeat = repeat or loc
+                continue
             return loc, spc_checked
         except Exception as e:
             print(f"Could not use {c['story']['title']}:", e)
+    if repeat:
+        print("No other story available, so repeating", repeat["city"])
+        return repeat, spc_checked
     print("No big weather story found")
     return None, spc_checked
 
 
+def recent_stories(hours):
+    """(state, story title) pairs featured in the last `hours` hours, from video_log.csv."""
+    out = set()
+    if not os.path.exists("video_log.csv"):
+        return out
+    now = datetime.now(timezone.utc)
+    with open("video_log.csv", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            try:
+                d = datetime.fromisoformat(r.get("date", ""))
+                d = d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            loc, story = r.get("location") or "", r.get("story") or ""
+            if (now - d).total_seconds() < hours * 3600 and ", " in loc and story:
+                out.add((loc.rsplit(", ", 1)[1], story))
+    return out
+
+
 # ---------- weather data ----------
 def get_data(loc):
-    periods = requests.get(loc["forecast"], headers=HDR, timeout=30).json()["properties"]["periods"][:4]
-    alerts = requests.get(f"https://api.weather.gov/alerts/active?point={loc['lat']},{loc['lon']}",
-                          headers=HDR, timeout=30).json()["features"]
+    fc = http_get(loc["forecast"]).json()["properties"]
+    periods = fc["periods"][:4]
+    loc["updated"] = fc.get("updateTime") or fc.get("generatedAt")
+    alerts = http_get(f"https://api.weather.gov/alerts/active?point={loc['lat']},{loc['lon']}").json()["features"]
     return periods, [a["properties"]["event"] for a in alerts]
 
 
@@ -360,8 +416,8 @@ def station_radar_url(station):
 def get_radar(url):
     """Download a looping radar GIF. Returns True if it worked."""
     try:
-        r = requests.get(url, headers=HDR, timeout=60)
-        if r.status_code == 200 and len(r.content) > 10000 and r.content[:3] == b"GIF":
+        r = http_get(url, timeout=60)
+        if len(r.content) > 10000 and r.content[:3] == b"GIF":
             with open("radar.gif", "wb") as f:
                 f.write(r.content)
             return True
@@ -528,8 +584,8 @@ def get_showdown(mode):
     rows = []
     for name, lat, lon in BIG_CITIES:
         try:
-            p = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=HDR, timeout=30).json()["properties"]
-            periods = requests.get(p["forecast"], headers=HDR, timeout=30).json()["properties"]["periods"][:4]
+            p = http_get(f"https://api.weather.gov/points/{lat},{lon}").json()["properties"]
+            periods = http_get(p["forecast"]).json()["properties"]["periods"][:4]
             day = pick_day_period(periods, mode)
             rows.append({"city": name, "temp": day["temperature"], "pop": pop(day),
                          "kind": precip_kind(day), "short": day["shortForecast"]})
@@ -546,7 +602,7 @@ def get_showdown(mode):
 def showdown_facts(sd, spc_checked, day_word):
     lines = []
     if spc_checked:
-        lines.append(f"Storm Prediction Center: no notable severe thunderstorm risk areas are forecast {day_word}")
+        lines.append(f"Storm Prediction Center: no significant severe thunderstorm risk areas are forecast {day_word}")
     lines.append(f"Hottest big city {day_word}: {sd['hot']['city']} at {sd['hot']['temp']} degrees")
     lines.append(f"Coldest big city {day_word}: {sd['cold']['city']} at {sd['cold']['temp']} degrees")
     lines.append(f"Temperature gap between them: {sd['gap']} degrees")
@@ -628,7 +684,7 @@ def make_hashtags(city, st, story):
 
 
 def fit_title(base):
-    return base + " #shorts" if len(base) <= 84 else base[:92]
+    return (base if len(base) <= 84 else base[:83].rstrip() + "…") + " #shorts"
 
 
 def make_title(mode, loc, story, periods):
@@ -655,6 +711,47 @@ def overview_title(total):
 
 
 # ---------- script writing ----------
+def voice_level(name):
+    """0 = a Microsoft edge-tts voice, 1 = gTTS, 2 = espeak."""
+    return {"gtts": 1, "espeak": 2}.get(name, 0)
+
+
+def make_voice(text, voice, path="voice.mp3", min_level=0):
+    """Microsoft's edge-tts first; if it fails, Google's gTTS; then the offline espeak-ng voice.
+    min_level skips the better engines (used to keep one voice for a whole video).
+    Returns the name of the voice that worked."""
+    if min_level < 1:
+        try:
+            asyncio.run(edge_tts.Communicate(text, voice).save(path))
+            if os.path.getsize(path) > 1000:
+                return voice
+        except Exception as e:
+            print("edge-tts failed, trying a backup voice:", e)
+    if min_level < 2:
+        try:
+            from gtts import gTTS
+            gTTS(text, lang="en", tld="us").save(path)
+            return "gtts"
+        except Exception as e:
+            print("gTTS failed, using the offline voice:", e)
+    wav = path.rsplit(".", 1)[0] + "_espeak.wav"
+    subprocess.run(["espeak-ng", "-v", "en-us", "-s", "165", "-w", wav, text], check=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", wav, path], check=True)
+    return "espeak"
+
+
+def as_of_text(iso=None, tz=None):
+    """'NWS data as of 7:02 AM CDT Oct 3', in the featured place's own time zone."""
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tz or TIMEZONE)
+        when = datetime.fromisoformat(iso).astimezone(zone) if iso else datetime.now(zone)
+    except Exception:
+        when = local_now()
+    clock = when.strftime("%I:%M %p").lstrip("0")
+    return f"NWS data as of {clock} {when.strftime('%Z')} {when.strftime('%b')} {when.day}  \u2022  weather.gov for the latest"
+
+
 def gemini_script(facts, style):
     from google import genai
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
@@ -664,9 +761,15 @@ Friendly, energetic. One sentence per line, 5 to 7 lines, no emojis, no numberin
 Last line is exactly: {CLOSING}
 Use ONLY these facts, add no other numbers or claims:
 {facts}"""
-    # Model names change. Check aistudio.google.com for the current fast/free model.
-    r = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-    return [l.strip() for l in r.text.splitlines() if l.strip()]
+    last = None
+    for model in GEMINI_MODELS:              # if one model is retired or busy, try the next
+        try:
+            r = client.models.generate_content(model=model, contents=prompt)
+            return [l.strip() for l in r.text.splitlines() if l.strip()]
+        except Exception as e:
+            last = e
+            print(f"Gemini model {model} failed:", e)
+    raise last
 
 
 def numbers_ok(lines, facts):
@@ -872,6 +975,7 @@ NIGHT_SKIES = {"clear": ((6, 12, 36), (38, 50, 98)), "cloudy": ((16, 22, 46), (6
                "snow": ((26, 36, 66), (92, 104, 138)), "fog": ((26, 30, 46), (80, 86, 102))}
 BRAND_SKY = ((10, 16, 44), (74, 40, 122))
 CLOUD_SETUPS = {"clear": 2, "cloudy": 6, "rain": 7, "storm": 7, "snow": 6, "fog": 4, "brand": 4}
+CLOUD_YS = [150, 330, 520, 640, 1520, 1700, 1820]    # vertical spots for clouds; weekly_recap.py swaps in landscape ones
 
 
 def draw_sky(img, d, t, kind, night=False, brand=False):
@@ -882,7 +986,7 @@ def draw_sky(img, d, t, kind, night=False, brand=False):
     rnd = random.Random(42)
     if night or brand:
         for _ in range(90):
-            x, y, z = rnd.randint(0, W), rnd.randint(0, 1200), rnd.random()
+            x, y, z = rnd.randint(0, W), rnd.randint(0, min(1200, H)), rnd.random()
             r = 1 + 2.2 * z * (0.6 + 0.4 * math.sin(t * 3 + x))
             d.ellipse([x - r, y - r, x + r, y + r], fill=(225, 230, 255))
     if kind == "clear" and not brand:
@@ -907,7 +1011,7 @@ def draw_sky(img, d, t, kind, night=False, brand=False):
                 "fog": (205, 210, 218)}.get(kind, (246, 248, 252))
     for k in range(n):
         depth = rnd.uniform(0.6, 1.4)
-        y = rnd.choice([150, 330, 520, 640, 1520, 1700, 1820]) + rnd.uniform(-50, 50)
+        y = rnd.choice(CLOUD_YS) + rnd.uniform(-50, 50)
         speed = 22 * depth
         x = (rnd.uniform(0, W + 600) + t * speed) % (W + 600) - 300
         cloud(x, y, 1.15 * depth, shade(fill, lerp(0.92, 1.05, depth - 0.6)))
@@ -931,7 +1035,7 @@ def draw_sky(img, d, t, kind, night=False, brand=False):
             for y in (520 + k * 40, 1500 + k * 50):
                 paste(band, x, y)
     if kind == "storm" and not brand and (t + 0.6) % 3.4 < 0.16:
-        bx = 180 + int(t * 37) % 700
+        bx = 180 + int(t * 37) % max(1, W - 380)
         pts, x, y = [], bx, 0
         r2 = random.Random(int(t * 3))
         while y < 620:
@@ -945,6 +1049,9 @@ def draw_sky(img, d, t, kind, night=False, brand=False):
 
 
 def finish_frame(img):
+    if AS_OF:
+        ImageDraw.Draw(img).text((W / 2, 1510), AS_OF, font=fit_font(ImageDraw.Draw(img), AS_OF, 1000, 30),
+                                 fill=(228, 232, 245), anchor="mm", stroke_width=3, stroke_fill=(8, 12, 30))
     if CUR.get("flash"):
         img.paste(Image.blend(img, Image.new("RGB", (W, H), (255, 255, 255)), 0.22))
         CUR["flash"] = False
@@ -1011,7 +1118,7 @@ def draw_caption(d, caption, ct):
         lines = textwrap.wrap(caption, width)
         if len(lines) <= most:
             break
-    y = 1560 + (1 - a) * 40
+    y = 1590 + (1 - a) * 40
     for line in lines[:most]:
         d.text((W / 2, y), line, font=font(size), fill="white" if a > 0.5 else (200, 205, 220), anchor="mm",
                stroke_width=6, stroke_fill=(8, 12, 30))
@@ -1111,7 +1218,7 @@ def duration(path):
 
 # ---------- main ----------
 def main():
-    global REGION, CURRENT_HOOK
+    global REGION, CURRENT_HOOK, AS_OF
     variants = choose_variants()
     CURRENT_HOOK = HOOK_TEXT[variants["hook"]]
     print("Testing:", variants)
@@ -1122,15 +1229,23 @@ def main():
 
     features = fetch_alerts()
     loc, spc_checked = choose_location(day, day_word, features)
-    spc_label = f"SPC: no severe storm risk {day_word}" if spc_checked else ""
+    event_only = os.environ.get("EVENT_ONLY") == "1"
+    if event_only and (not loc or loc["story"]["score"] < EVENT_SCORE):
+        print("Big-event check: nothing big enough right now, so no extra video.")
+        return
+    # Marginal risks are too small to feature, so only claim "no significant" risk, never "none".
+    spc_label = f"SPC: no significant storm risk {day_word}" if spc_checked else ""
     green = (150, 235, 150)
 
     if loc:
         # ---- a local story: storms, winter storm, hurricane, heat, flood, etc. ----
         REGION = f"{loc['city']}, {loc['state']}"
         story = loc["story"]
+        if event_only:
+            story = dict(story, label="LIVE UPDATE \u2022 " + story["label"])
         print("Location:", REGION, f"({loc['lat']}, {loc['lon']})", "radar", loc["radar"], "|", story["title"])
         periods, alerts = get_data(loc)
+        AS_OF = as_of_text(loc.get("updated"), loc.get("tz"))
         has_radar = get_radar(station_radar_url(loc["radar"]))
         if mode == "evening":
             info = evening_info(periods)
@@ -1152,6 +1267,7 @@ def main():
         fmt = story["category"]
     else:
         REGION = "United States"
+        AS_OF = as_of_text()
         has_radar = get_radar(NATIONAL_RADAR_URL)
         try:
             # ---- quiet day: big-city showdown ----
@@ -1183,7 +1299,7 @@ def main():
             fmt = "overview"
 
     print("\n".join(lines))
-    asyncio.run(edge_tts.Communicate(" ".join(lines), variants["voice"]).save("voice.mp3"))
+    voice_used = make_voice(" ".join(lines), variants["voice"])
     clip_len = duration("voice.mp3")
     words = [len(l.split()) for l in lines]
 
@@ -1209,16 +1325,22 @@ def main():
                         "-c:a", "aac", "-shortest", "out.mp4"], check=True)
 
     title = apply_title_style(title, variants["title_style"])
+    if event_only:
+        title = fit_title("UPDATE: " + (title[:-len(" #shorts")] if title.endswith(" #shorts") else title))
     with open("run_info.json", "w", encoding="utf-8") as f:
         json.dump({"date": local_now().isoformat(timespec="minutes"), "mode": mode, "format": fmt,
-                   "location": REGION, "voice": variants["voice"], "hook": variants["hook"],
-                   "title_style": variants["title_style"], "script_source": SCRIPT_SOURCE}, f)
+                   "location": REGION, "voice": variants["voice"], "voice_used": voice_used,
+                   "hook": variants["hook"], "title_style": variants["title_style"],
+                   "script_source": SCRIPT_SOURCE, "story": loc["story"]["title"] if loc else fmt,
+                   "score": loc["story"]["score"] if loc else 0, "event": event_only}, f)
     with open("caption.txt", "w", encoding="utf-8") as f:
         f.write(f"{title}\n{tags}\n\nData: National Weather Service and NOAA Storm Prediction Center. "
-                f"Outlooks and watches are not warnings; check weather.gov for alerts in your area.\n")
+                f"Outlooks and watches are not warnings; check weather.gov for alerts in your area. "
+                f"Narrated with a synthetic voice.\n")
     print("Title:", title)
     print("Tags:", tags)
     print("Done: out.mp4")
 
 
-main()
+if __name__ == "__main__":
+    main()
