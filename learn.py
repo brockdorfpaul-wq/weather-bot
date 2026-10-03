@@ -9,8 +9,10 @@ MIN_AGE_HOURS = 48      # give each video two days to collect views before judgi
 MIN_SAMPLES = 5         # each option needs at least this many videos before it can win
 EXPLORE_RATE = 0.25     # share of videos that keep testing the non-winning options
 MIN_MARGIN = 0.10       # a winner must beat the runner-up by about 10% in views, or it's a tie
-EXPERIMENTS = ["voice", "hook", "title_style"]
 # ------------------------------
+
+from make_video import EXPERIMENTS as OPTIONS    # one list of tested options, shared with the video maker
+EXPERIMENTS = list(OPTIONS)
 
 
 def parse_date(text):
@@ -54,13 +56,18 @@ def analyze(rows, stats, previous_best):
             videos.append({**r, **stats[r["video_id"]]})
 
     # Compare each video with others of the same kind (a snowstorm day naturally gets more
-    # views than a quiet day), so the test measures the option, not the weather.
-    by_format = defaultdict(list)
+    # views than a quiet day, and morning, evening and big-event updates get different audiences),
+    # so the test measures the option, not the weather or the time of day.
+    def kind(v):
+        return (v.get("format", ""), v.get("mode", ""), str(v.get("event", "")).lower() == "true")
+
+    by_kind, by_format = defaultdict(list), defaultdict(list)
     for v in videos:
         v["score"] = math.log1p(v["views"])
+        by_kind[kind(v)].append(v["score"])
         by_format[v.get("format", "")].append(v["score"])
     for v in videos:
-        v["relative"] = v["score"] - statistics.mean(by_format[v.get("format", "")])
+        v["relative"] = v["score"] - statistics.mean(by_kind[kind(v)])
 
     results, best = {}, dict(previous_best)
     for exp in EXPERIMENTS:
@@ -68,7 +75,7 @@ def analyze(rows, stats, previous_best):
         for v in videos:
             if exp == "hook" and v.get("script_source") != "gemini":
                 continue          # the hook only applies when Gemini wrote the script
-            if v.get(exp):
+            if v.get(exp) in OPTIONS[exp]:         # ignores old rows that logged a fallback voice like "gtts"
                 groups[v[exp]].append(v)
         results[exp] = {opt: {"videos": len(vs),
                               "median_views": statistics.median(x["views"] for x in vs),
