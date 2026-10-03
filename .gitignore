@@ -1,0 +1,23 @@
+# secrets
+client_secret.json
+*.token
+.env
+
+# files the bot generates on each run
+radar.gif
+map_*.gif
+voice.mp3
+*_espeak.wav
+seg*.mp3
+seg*.wav
+recap_parts.txt
+recap_voice.wav
+bg.mp4
+out.mp4
+recap.mp4
+recap_thumb.png
+run_info.json
+caption.txt
+
+__pycache__/
+*.pyc
