@@ -1,4 +1,4 @@
-import os, re, asyncio, subprocess, textwrap, requests
+import os, re, json, random, asyncio, subprocess, textwrap, requests
 from collections import Counter
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
@@ -6,7 +6,13 @@ import edge_tts
 
 # ---------- SETTINGS: edit these ----------
 CONTACT = "brockdorf.paul@gmail.com"         # NWS/SPC ask for an identifying User-Agent; use your email
-VOICE = "en-US-AriaNeural"          # try en-US-AndrewNeural for a male news-style voice
+# Things the bot tests automatically. learn.py measures which option gets more views and
+# saves the winner in learned_settings.json; make_video.py then uses the winner most of the time.
+EXPERIMENTS = {
+    "voice": ["en-US-AriaNeural", "en-US-AndrewNeural"],
+    "hook": ["question", "bold"],
+    "title_style": ["standard", "swapped"],
+}
 TIMEZONE = "America/Chicago"
 EVENING_START_HOUR = 14             # runs at or after 2 PM local time make the evening video
 MIN_STORY_SCORE = 40                # how big a weather story must be to get its own location (see STORY SCORES)
@@ -27,6 +33,10 @@ HDR = {"User-Agent": f"(weatherbot, {CONTACT})"}
 W, H = 1080, 1920
 CLOSING = "Follow for your daily forecast."
 REGION = "United States"            # reset in main() to the chosen location
+HOOK_TEXT = {"question": "Make the very first line a short question that sparks curiosity.",
+             "bold": "Make the very first line a short, bold, surprising statement."}
+CURRENT_HOOK = ""                    # set in main() from the chosen hook style
+SCRIPT_SOURCE = "template"           # "gemini" or "template", recorded for learning
 
 # ---------- STORY SCORES: how the biggest weather story of the day is chosen ----------
 SPC_LEVELS = {"TSTM": 0, "MRGL": 1, "SLGT": 2, "ENH": 3, "MDT": 4, "HIGH": 5}
@@ -89,6 +99,38 @@ REGIONS = {
     "southeast": {"AL", "AR", "DE", "DC", "FL", "GA", "KY", "LA", "MD", "MS", "NC", "SC", "TN", "VA", "WV"},
     "west": {"AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY", "CA", "OR", "WA", "AK", "HI"},
 }
+
+
+# ---------- learning: pick which options to use for this video ----------
+def load_settings():
+    try:
+        with open("learned_settings.json", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def choose_variants():
+    """Use the best-performing option most of the time, and keep testing the others."""
+    s = load_settings()
+    best = s.get("best", {})
+    explore = s.get("explore_rate", 0.3)
+    out = {}
+    for name, options in EXPERIMENTS.items():
+        b = best.get(name)
+        out[name] = b if (b in options and random.random() > explore) else random.choice(options)
+    return out
+
+
+def apply_title_style(title, style):
+    """'swapped' turns 'Duluth, MN: Winter Storm Warning' into 'Winter Storm Warning: Duluth, MN'."""
+    if style != "swapped":
+        return title
+    base = title[:-len(" #shorts")] if title.endswith(" #shorts") else title
+    if ": " not in base:
+        return title
+    left, right = base.split(": ", 1)
+    return fit_title(f"{right}: {left}")
 
 
 # ---------- mode ----------
@@ -638,9 +680,12 @@ def numbers_ok(lines, facts):
 
 
 def make_script(facts, fallback, style):
+    global SCRIPT_SOURCE
+    SCRIPT_SOURCE = "template"
     try:
-        lines = gemini_script(facts, style)
+        lines = gemini_script(facts, style + " " + CURRENT_HOOK)
         if 4 <= len(lines) <= 9 and numbers_ok(lines, facts):
+            SCRIPT_SOURCE = "gemini"
             return lines
         print("Gemini script failed checks, using template")
     except Exception as e:
@@ -771,7 +816,10 @@ def duration(path):
 
 # ---------- main ----------
 def main():
-    global REGION
+    global REGION, CURRENT_HOOK
+    variants = choose_variants()
+    CURRENT_HOOK = HOOK_TEXT[variants["hook"]]
+    print("Testing:", variants)
     mode = pick_mode()
     day = 2 if mode == "evening" else 1            # evening video uses tomorrow's (Day 2) SPC outlook
     day_word = "tomorrow" if mode == "evening" else "today"
@@ -806,6 +854,7 @@ def main():
             radar_filter = ("[1:v]scale=860:-2[r];[0:v][r]overlay=(W-w)/2:645:shortest=1,format=yuv420p[v]")
         title = make_title(mode, loc, story, periods)
         tags = " ".join(make_hashtags(loc["city"], loc["state"], story))
+        fmt = story["category"]
     else:
         REGION = "United States"
         has_radar = get_radar(NATIONAL_RADAR_URL)
@@ -820,6 +869,7 @@ def main():
                             "[0:v][r]overlay=(W-w)/2:1192-h/2:shortest=1,format=yuv420p[v]")
             title = showdown_title(sd, day_word)
             tags = "#usweather #nationalweather #weather #forecast #shorts"
+            fmt = "showdown"
         except Exception as e:
             # ---- last resort: US-wide alert overview ----
             print("Showdown failed, making an alert overview instead:", e)
@@ -835,9 +885,10 @@ def main():
             radar_filter = ("[1:v]scale=860:-2[r];[0:v][r]overlay=(W-w)/2:1045-h/2:shortest=1,format=yuv420p[v]")
             title = overview_title(total)
             tags = "#usweather #nationalweather #weather #forecast #shorts"
+            fmt = "overview"
 
     print("\n".join(lines))
-    asyncio.run(edge_tts.Communicate(" ".join(lines), VOICE).save("voice.mp3"))
+    asyncio.run(edge_tts.Communicate(" ".join(lines), variants["voice"]).save("voice.mp3"))
     clip_len = duration("voice.mp3")
     words = [len(l.split()) for l in lines]
 
@@ -861,6 +912,11 @@ def main():
         subprocess.run(["ffmpeg", "-y", "-i", "bg.mp4", "-i", "voice.mp3", "-c:v", "copy",
                         "-c:a", "aac", "-shortest", "out.mp4"], check=True)
 
+    title = apply_title_style(title, variants["title_style"])
+    with open("run_info.json", "w", encoding="utf-8") as f:
+        json.dump({"date": local_now().isoformat(timespec="minutes"), "mode": mode, "format": fmt,
+                   "location": REGION, "voice": variants["voice"], "hook": variants["hook"],
+                   "title_style": variants["title_style"], "script_source": SCRIPT_SOURCE}, f)
     with open("caption.txt", "w", encoding="utf-8") as f:
         f.write(f"{title}\n{tags}\n\nData: National Weather Service and NOAA Storm Prediction Center. "
                 f"Outlooks and watches are not warnings; check weather.gov for alerts in your area.\n")
