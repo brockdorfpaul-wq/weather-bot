@@ -12,13 +12,41 @@ if not CONTACT:
     print("Warning: NWS_CONTACT_EMAIL is not set; using a placeholder contact. "
           "Set the secret so the NWS has a real way to reach you.")
     CONTACT = "bot@example.com"
-# Things the bot tests automatically. learn.py measures which option gets more views and
-# saves the winner in learned_settings.json; make_video.py then uses the winner most of the time.
-EXPERIMENTS = {
-    "voice": ["en-US-AriaNeural", "en-US-AndrewNeural"],
-    "hook": ["question", "bold"],
-    "title_style": ["standard", "swapped"],
+# Things the bot tests automatically. learn.py measures which option gets more views (or comments, for
+# the call to action) and saves the winner in learned_settings.json; the video uses the winner most of
+# the time. These built-in options are permanent baselines. The weekly AI analyst (analyst.py) can add
+# its own hook styles, title formats and calls to action in experiments.json, and retires its losers.
+BUILTIN_EXPERIMENTS = {
+    "voice": {"en-US-AriaNeural": {}, "en-US-AndrewNeural": {}},
+    "hook": {"question": {"text": "Make the very first line a short question that sparks curiosity."},
+             "bold": {"text": "Make the very first line a short, bold, surprising statement."}},
+    "title_style": {"standard": {}, "swapped": {}},
+    "cta": {"city": {"text": "Drop your city in the comments and tell us what your sky looks like right now."},
+            "poll": {"text": "Rain, snow or sunshine: what are you hoping for this week? Tell us in the comments."}},
 }
+
+
+def load_experiments():
+    """Built-in options plus the AI analyst's options from experiments.json (active and retired)."""
+    defs = {name: {opt: dict(d, source="builtin", status="active") for opt, d in opts.items()}
+            for name, opts in BUILTIN_EXPERIMENTS.items()}
+    try:
+        with open("experiments.json", encoding="utf-8") as f:
+            extra = json.load(f)
+    except Exception:
+        extra = {}
+    for name, opts in extra.items():
+        if name in defs and isinstance(opts, dict):
+            for opt, d in opts.items():
+                if opt not in defs[name] and isinstance(d, dict):
+                    defs[name][opt] = d
+    return defs
+
+
+EXP_DEFS = load_experiments()
+EXPERIMENTS = {name: [o for o, d in opts.items() if d.get("status", "active") == "active"]
+               for name, opts in EXP_DEFS.items()}          # options currently being tested
+ALL_OPTIONS = {name: list(opts) for name, opts in EXP_DEFS.items()}   # includes retired ones, for history
 TIMEZONE = "America/Chicago"
 EVENING_START_HOUR = 14             # runs at or after 2 PM local time make the evening video
 MIN_STORY_SCORE = 40                # how big a weather story must be to get its own location (see STORY SCORES)
@@ -62,9 +90,9 @@ W, H = 1080, 1920
 CLOSING = "Follow for your daily forecast."
 REGION = "United States"            # reset in main() to the chosen location
 AS_OF = ""                          # "NWS data as of ..." line, set in main()
-HOOK_TEXT = {"question": "Make the very first line a short question that sparks curiosity.",
-             "bold": "Make the very first line a short, bold, surprising statement."}
 CURRENT_HOOK = ""                    # set in main() from the chosen hook style
+CURRENT_CTA = ""                     # the comment prompt for this video, set in main()
+VIDEO_LEN = 0.0                      # video length in seconds, set in main() (for the end-of-video comment card)
 SCRIPT_SOURCE = "template"           # "gemini" or "template", recorded for learning
 
 # ---------- STORY SCORES: how the biggest weather story of the day is chosen ----------
@@ -151,15 +179,26 @@ def choose_variants():
     return out
 
 
-def apply_title_style(title, style):
-    """'swapped' turns 'Duluth, MN: Winter Storm Warning' into 'Winter Storm Warning: Duluth, MN'."""
+def apply_title_style(title, style, place=None, topic=None):
+    """Returns (title, style actually used).
+    'swapped' turns 'Duluth, MN: Winter Storm Warning' into 'Winter Storm Warning: Duluth, MN'.
+    AI-invented styles are templates with {place} and {topic}; they only apply to single-place stories,
+    so other videos fall back to the standard title (and are logged as 'standard')."""
+    template = EXP_DEFS.get("title_style", {}).get(style, {}).get("template")
+    if template:
+        if place and topic:
+            try:
+                return fit_title(template.format(place=place, topic=topic)), style
+            except Exception as e:
+                print("Title template failed, using the standard title:", e)
+        return title, "standard"
     if style != "swapped":
-        return title
+        return title, "standard"
     base = title[:-len(" #shorts")] if title.endswith(" #shorts") else title
     if ": " not in base:
-        return title
+        return title, "standard"
     left, right = base.split(": ", 1)
-    return fit_title(f"{right}: {left}")
+    return fit_title(f"{right}: {left}"), "swapped"
 
 
 # ---------- mode ----------
@@ -357,16 +396,20 @@ def choose_location(day, day_word, features):
     except Exception as e:
         print("SPC error:", e)
     cands += alert_candidates(features)
-    fatigue = load_settings().get("story_fatigue", {})
+    settings = load_settings()
+    fatigue = settings.get("story_fatigue", {})
+    model = settings.get("story_model") or {}
+    asked = viewer_states()
+    mode = pick_mode()
     for c in cands:
-        # Only nudges ordinary-story tie-breaking; never touches genuine emergencies (score >= EVENT_SCORE).
-        mult = fatigue.get(c["story"]["category"], 1.0) if c["score"] < EVENT_SCORE else 1.0
-        c["adjusted"] = c["score"] * mult
+        # First pass (before we know the state): fatigue and the model's category/season/time effects.
+        c["adjusted"] = adjust(c["score"], fatigue.get(c["story"]["category"], 1.0) *
+                               model_mult(model, c["story"]["category"], None, mode))
     cands.sort(key=lambda c: (c["adjusted"], c["size"]), reverse=True)
     event_only = os.environ.get("EVENT_ONLY") == "1"
     recent = recent_stories(REPEAT_HOURS)
     cooling = recent_stories(EVENT_COOLDOWN_HOURS) if event_only else set()
-    repeat = None
+    repeat, pool = None, []
     for c in cands[:6]:
         try:
             lon, lat = c["point"]()
@@ -380,14 +423,73 @@ def choose_location(day, day_word, features):
                 print(f"Recently featured {key[1]} in {key[0]}; looking for a different story first")
                 repeat = repeat or loc
                 continue
-            return loc, spc_checked
+            # Second pass, now that we know the state: add the region effect and viewer requests.
+            pred = model_mult(model, c["story"]["category"], loc["state"], mode)
+            boost = VIEWER_BOOST if loc["state"] in asked else 1.0
+            loc["predicted"] = pred
+            final = adjust(c["score"], fatigue.get(c["story"]["category"], 1.0) * pred * boost)
+            pool.append((final, c["size"], loc))
+            if len(pool) >= 3:
+                break
         except Exception as e:
             print(f"Could not use {c['story']['title']}:", e)
+    if pool:
+        final, _, loc = max(pool, key=lambda x: (x[0], x[1]))
+        if len(pool) > 1:
+            print("Story ranking:", ", ".join(f"{p[2]['story']['title']} in {p[2]['state']} ({p[0]:.1f})" for p in pool))
+        return loc, spc_checked
     if repeat:
         print("No other story available, so repeating", repeat["city"])
         return repeat, spc_checked
     print("No big weather story found")
     return None, spc_checked
+
+
+VIEWER_BOOST = 1.05     # small nudge toward states viewers asked about in the comments
+MODEL_MIN_VIDEOS = 30   # the prediction model only steers picks once it has learned from this many videos
+MODEL_CLIP = (0.85, 1.15)
+
+
+def adjust(score, mult):
+    """Ordinary stories get nudged by learning; genuine emergencies (score >= EVENT_SCORE) never do,
+    and a nudged ordinary story can never climb past an emergency."""
+    if score >= EVENT_SCORE:
+        return score
+    return min(score * mult, EVENT_SCORE - 0.01)
+
+
+def season_of(month):
+    return {12: "winter", 1: "winter", 2: "winter", 3: "spring", 4: "spring", 5: "spring",
+            6: "summer", 7: "summer", 8: "summer"}.get(month, "fall")
+
+
+def region_of(state):
+    for region, states in REGIONS.items():
+        if state in states:
+            return region
+    return "other"
+
+
+def model_mult(model, category, state, mode):
+    """Predicted views for this kind of story compared with average, from learn.py's model, kept to a
+    gentle range. Returns 1.0 (no effect) until the model has learned from enough videos."""
+    if not model or model.get("n", 0) < MODEL_MIN_VIDEOS:
+        return 1.0
+    eff = model.get("effects", {})
+    total = (eff.get("category", {}).get(category, 0.0) + eff.get("season", {}).get(season_of(local_now().month), 0.0)
+             + eff.get("mode", {}).get(mode, 0.0))
+    if state:
+        total += eff.get("region", {}).get(region_of(state), 0.0)
+    return max(MODEL_CLIP[0], min(MODEL_CLIP[1], math.exp(total)))
+
+
+def viewer_states():
+    """States viewers asked about recently, from analyst.py's comment summary."""
+    try:
+        with open("viewer_insights.json", encoding="utf-8") as f:
+            return set(json.load(f).get("states", {}))
+    except Exception:
+        return set()
 
 
 def recent_stories(hours):
@@ -784,6 +886,15 @@ def numbers_ok(lines, facts):
     return all(n in allowed for n in re.findall(r"\d+", " ".join(lines)))
 
 
+def add_cta(lines):
+    """Puts the comment prompt just before the closing line (once)."""
+    if not CURRENT_CTA or any(CURRENT_CTA.lower() in l.lower() for l in lines):
+        return lines
+    if lines and lines[-1] == CLOSING:
+        return lines[:-1] + [CURRENT_CTA, CLOSING]
+    return lines + [CURRENT_CTA]
+
+
 def make_script(facts, fallback, style):
     global SCRIPT_SOURCE
     SCRIPT_SOURCE = "template"
@@ -791,11 +902,11 @@ def make_script(facts, fallback, style):
         lines = gemini_script(facts, style + " " + CURRENT_HOOK)
         if 4 <= len(lines) <= 9 and numbers_ok(lines, facts):
             SCRIPT_SOURCE = "gemini"
-            return lines
+            return add_cta(lines)
         print("Gemini script failed checks, using template")
     except Exception as e:
         print("Gemini error, using template:", e)
-    return fallback
+    return add_cta(fallback)
 
 
 # ---------- drawing: animated, branded AtmosSquall style ----------
@@ -1056,7 +1167,21 @@ def draw_sky(img, d, t, kind, night=False, brand=False):
 
 
 def finish_frame(img):
-    if AS_OF:
+    t = CUR.get("t", 0.0)
+    if CURRENT_CTA and VIDEO_LEN and t > VIDEO_LEN - 4.5:
+        d = ImageDraw.Draw(img)
+        a = ease((t - (VIDEO_LEN - 4.5)) / 0.35)
+        pulse = 0.5 + 0.5 * math.sin(t * 6)
+        w2, y = 290 + 16 * pulse, 1520 + (1 - a) * 30
+        col = mix(BRAND_CYAN, BRAND_PURPLE, pulse)
+        d.rounded_rectangle([W / 2 - w2 - 5, y - 33, W / 2 + w2 + 5, y + 33], radius=33, fill=shade(col, 0.5))
+        d.rounded_rectangle([W / 2 - w2, y - 28, W / 2 + w2, y + 28], radius=28, fill=col)
+        bx = W / 2 - w2 + 48                                   # a little speech bubble icon
+        d.rounded_rectangle([bx - 22, y - 17, bx + 22, y + 11], radius=9, fill="white")
+        d.polygon([(bx - 10, y + 9), (bx - 1, y + 9), (bx - 14, y + 21)], fill="white")
+        d.text((W / 2 + 24, y), "COMMENT BELOW", font=font(40), fill="white", anchor="mm",
+               stroke_width=3, stroke_fill=(8, 12, 30))
+    elif AS_OF:
         ImageDraw.Draw(img).text((W / 2, 1510), AS_OF, font=fit_font(ImageDraw.Draw(img), AS_OF, 1000, 30),
                                  fill=(228, 232, 245), anchor="mm", stroke_width=3, stroke_fill=(8, 12, 30))
     if CUR.get("flash"):
@@ -1225,9 +1350,10 @@ def duration(path):
 
 # ---------- main ----------
 def main():
-    global REGION, CURRENT_HOOK, AS_OF
+    global REGION, CURRENT_HOOK, AS_OF, CURRENT_CTA, VIDEO_LEN
     variants = choose_variants()
-    CURRENT_HOOK = HOOK_TEXT[variants["hook"]]
+    CURRENT_HOOK = EXP_DEFS["hook"][variants["hook"]].get("text", "")
+    CURRENT_CTA = EXP_DEFS["cta"][variants["cta"]].get("text", "")
     print("Testing:", variants)
     mode = pick_mode()
     day = 2 if mode == "evening" else 1            # evening video uses tomorrow's (Day 2) SPC outlook
@@ -1316,7 +1442,10 @@ def main():
         starts.append(acc)
         acc += clip_len * n / sum(words)
 
+    VIDEO_LEN = clip_len
+
     def frame_at(t):
+        CUR["t"] = t
         i = max(k for k in range(len(lines)) if starts[k] <= t + 1e-6)
         return draw(t, t - starts[i], lines[i])
     render_video(frame_at, clip_len, "bg.mp4")
@@ -1331,15 +1460,18 @@ def main():
         subprocess.run(["ffmpeg", "-y", "-i", "bg.mp4", "-i", "voice.mp3", "-c:v", "copy",
                         "-c:a", "aac", "-shortest", "out.mp4"], check=True)
 
-    title = apply_title_style(title, variants["title_style"])
+    title, title_used = apply_title_style(title, variants["title_style"],
+                                          REGION if loc else None, loc["story"]["title"] if loc else None)
     if event_only:
         title = fit_title("UPDATE: " + (title[:-len(" #shorts")] if title.endswith(" #shorts") else title))
     with open("run_info.json", "w", encoding="utf-8") as f:
         json.dump({"date": local_now().isoformat(timespec="minutes"), "mode": mode, "format": fmt,
                    "location": REGION, "voice": variants["voice"], "voice_used": voice_used,
-                   "hook": variants["hook"], "title_style": variants["title_style"],
+                   "hook": variants["hook"], "title_style": title_used, "cta": variants["cta"],
+                   "cta_text": CURRENT_CTA, "script": " | ".join(lines),
                    "script_source": SCRIPT_SOURCE, "story": loc["story"]["title"] if loc else fmt,
-                   "score": loc["story"]["score"] if loc else 0, "event": event_only}, f)
+                   "score": loc["story"]["score"] if loc else 0, "event": event_only,
+                   "predicted": round(loc.get("predicted", 1.0), 3) if loc else 1.0}, f)
     with open("caption.txt", "w", encoding="utf-8") as f:
         f.write(f"{title}\n{tags}\n\nData: National Weather Service and NOAA Storm Prediction Center. "
                 f"Outlooks and watches are not warnings; check weather.gov for alerts in your area. "
