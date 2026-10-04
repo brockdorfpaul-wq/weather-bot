@@ -357,7 +357,12 @@ def choose_location(day, day_word, features):
     except Exception as e:
         print("SPC error:", e)
     cands += alert_candidates(features)
-    cands.sort(key=lambda c: (c["score"], c["size"]), reverse=True)
+    fatigue = load_settings().get("story_fatigue", {})
+    for c in cands:
+        # Only nudges ordinary-story tie-breaking; never touches genuine emergencies (score >= EVENT_SCORE).
+        mult = fatigue.get(c["story"]["category"], 1.0) if c["score"] < EVENT_SCORE else 1.0
+        c["adjusted"] = c["score"] * mult
+    cands.sort(key=lambda c: (c["adjusted"], c["size"]), reverse=True)
     event_only = os.environ.get("EVENT_ONLY") == "1"
     recent = recent_stories(REPEAT_HOURS)
     cooling = recent_stories(EVENT_COOLDOWN_HOURS) if event_only else set()
