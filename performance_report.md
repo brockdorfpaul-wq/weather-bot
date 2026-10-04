@@ -1,6 +1,6 @@
 # Weather bot performance report
 
-Updated 2026-10-04 01:55 UTC. 0 of 3 logged videos are old enough to judge (at least 48 hours).
+Updated 2026-10-04 18:33 UTC. 0 of 4 logged videos are old enough to judge (at least 48 hours).
 
 ## Current winners
 
@@ -32,8 +32,8 @@ A category is flagged once it's dominated recent scheduling (≥40% of the last 
 
 | Category | Recent share | Judged videos | Score vs similar | Flagged |
 |---|---|---|---|---|
-| heat | 67% | 0 | — |  |
-| flood | 33% | 0 | — |  |
+| heat | 75% | 0 | — |  |
+| flood | 25% | 0 | — |  |
 | storm | 0% | 0 | — |  |
 | winter | 0% | 0 | — |  |
 | tropical | 0% | 0 | — |  |
