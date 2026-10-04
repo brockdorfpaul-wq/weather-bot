@@ -23,7 +23,7 @@ try:
 except Exception:
     info = {}
 FIELDS = ["date", "video_id", "mode", "format", "location", "voice", "voice_used", "hook",
-          "title_style", "script_source", "title", "story", "score", "event"]
+          "title_style", "cta", "script_source", "title", "story", "score", "event", "predicted", "script"]
 rows = []
 if os.path.exists("video_log.csv"):
     with open("video_log.csv", encoding="utf-8") as f:
@@ -34,3 +34,13 @@ with open("video_log.csv", "w", newline="", encoding="utf-8") as f:   # rewritin
     w.writeheader()
     w.writerows(rows)
 print("Logged in video_log.csv")
+
+# Start the conversation: post the video's comment prompt as the channel's own first comment.
+# This needs the youtube.force-ssl permission (see get_token.py); without it, the video still posts.
+if info.get("cta_text"):
+    try:
+        yt.commentThreads().insert(part="snippet", body={"snippet": {"videoId": video_id, "topLevelComment": {
+            "snippet": {"textOriginal": info["cta_text"]}}}}).execute()
+        print("Posted the first comment")
+    except Exception as e:
+        print("Could not post the first comment (does the token include the comment permission?):", e)
