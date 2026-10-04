@@ -7,7 +7,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ---------- SETTINGS: edit these ----------
-CONTACT = "brockdorf.paul@gmail.com"         # NWS/SPC ask for an identifying User-Agent; use your email
+CONTACT = os.environ.get("NWS_CONTACT_EMAIL")         # NWS/SPC ask for an identifying User-Agent; use your email
+if not CONTACT:
+    print("Warning: NWS_CONTACT_EMAIL is not set; using a placeholder contact. "
+          "Set the secret so the NWS has a real way to reach you.")
+    CONTACT = "bot@example.com"
 # Things the bot tests automatically. learn.py measures which option gets more views and
 # saves the winner in learned_settings.json; make_video.py then uses the winner most of the time.
 EXPERIMENTS = {
@@ -712,13 +716,15 @@ def overview_title(total):
 
 # ---------- script writing ----------
 def voice_level(name):
-    """0 = a Microsoft edge-tts voice, 1 = gTTS, 2 = espeak."""
-    return {"gtts": 1, "espeak": 2}.get(name, 0)
+    """0 = a Microsoft edge-tts voice, 1 = gTTS."""
+    return {"gtts": 1}.get(name, 0)
 
 
 def make_voice(text, voice, path="voice.mp3", min_level=0):
-    """Microsoft's edge-tts first; if it fails, Google's gTTS; then the offline espeak-ng voice.
-    min_level skips the better engines (used to keep one voice for a whole video).
+    """Microsoft's edge-tts first; if it fails, Google's gTTS. No further fallback: an offline
+    robotic voice would hurt watch time more than skipping a video, so this fails loudly instead,
+    which fails the GitHub Actions run and emails you, rather than posting low-quality audio.
+    min_level skips the better engine (used to keep one voice for a whole video).
     Returns the name of the voice that worked."""
     if min_level < 1:
         try:
@@ -727,17 +733,13 @@ def make_voice(text, voice, path="voice.mp3", min_level=0):
                 return voice
         except Exception as e:
             print("edge-tts failed, trying a backup voice:", e)
-    if min_level < 2:
-        try:
-            from gtts import gTTS
-            gTTS(text, lang="en", tld="us").save(path)
-            return "gtts"
-        except Exception as e:
-            print("gTTS failed, using the offline voice:", e)
-    wav = path.rsplit(".", 1)[0] + "_espeak.wav"
-    subprocess.run(["espeak-ng", "-v", "en-us", "-s", "165", "-w", wav, text], check=True)
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", wav, path], check=True)
-    return "espeak"
+    try:
+        from gtts import gTTS
+        gTTS(text, lang="en", tld="us").save(path)
+        return "gtts"
+    except Exception as e:
+        print("gTTS failed:", e)
+    raise RuntimeError("Both edge-tts and gTTS failed to generate audio; not posting a low-quality voice.")
 
 
 def as_of_text(iso=None, tz=None):
