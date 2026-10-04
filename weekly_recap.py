@@ -487,20 +487,45 @@ def narrate(segs, voice):
     return durations, used
 
 
-def make_thumbnail(stories, week_of, path):
+THUMB_VARIANTS = ["standard", "alt"]
+
+
+def choose_thumb_variant():
+    """Reuses the same win-most-of-the-time / keep-testing pattern as the Shorts' voice/hook/title tests."""
+    s = mv.load_settings()
+    best = (s.get("weekly_best") or {}).get("thumb_variant")
+    explore = s.get("explore_rate", 0.3)
+    if best in THUMB_VARIANTS and random.random() > explore:
+        return best
+    return random.choice(THUMB_VARIANTS)
+
+
+def make_thumbnail(stories, week_of, path, variant="standard"):
     img = Image.new("RGB", (W, H))
     d = ImageDraw.Draw(img)
     CUR["img"], CUR["flash"] = img, False
-    mv.draw_sky(img, d, 2.0, "storm" if stories else "cloudy", brand=not stories)
-    lg = mv.logo_sprite(560)
-    mv.paste(mv.glow_sprite(420, mv.BRAND_CYAN, 160), 430 - 420, 540 - 420)
-    if lg is not None:
-        mv.paste(lg, 430 - 280, 540 - 280)
-    txt(d, (1300, 330), "WEEK IN", 170, max_w=1000, stroke=8)
-    txt(d, (1300, 500), "WEATHER", 170, max_w=1000, stroke=8, fill=mv.BRAND_GOLD)
     sub = stories[-1]["story"].upper() if stories else "THE WEEK AHEAD"
-    txt(d, (1300, 660), sub, 70, max_w=1000, fill=mv.BRAND_CYAN, stroke=6)
-    txt(d, (1300, 770), f"WEEK OF {week_of.upper()}", 56, max_w=1000, stroke=5)
+    if variant == "alt":
+        # Big-number, stat-card style: leads with a number instead of the "WEEK IN WEATHER" wordmark.
+        mv.draw_sky(img, d, 2.0, "storm" if stories else "cloudy", brand=True)
+        txt(d, (960, 150), "THIS WEEK", 64, fill=mv.BRAND_GOLD, stroke=5)
+        big = str(len(stories)) if stories else "0"
+        txt(d, (960, 420), big, 320, stroke=10)
+        txt(d, (960, 620), ("MAJOR STORIES" if stories else "QUIET WEEK"), 70, fill=mv.BRAND_CYAN, stroke=6)
+        txt(d, (960, 690), sub, 46, max_w=1700, stroke=4)
+        lg = mv.logo_sprite(170)
+        if lg is not None:
+            mv.paste(lg, 1920 - 220, 1080 - 220)
+    else:
+        mv.draw_sky(img, d, 2.0, "storm" if stories else "cloudy", brand=not stories)
+        lg = mv.logo_sprite(560)
+        mv.paste(mv.glow_sprite(420, mv.BRAND_CYAN, 160), 430 - 420, 540 - 420)
+        if lg is not None:
+            mv.paste(lg, 430 - 280, 540 - 280)
+        txt(d, (1300, 330), "WEEK IN", 170, max_w=1000, stroke=8)
+        txt(d, (1300, 500), "WEATHER", 170, max_w=1000, stroke=8, fill=mv.BRAND_GOLD)
+        txt(d, (1300, 660), sub, 70, max_w=1000, fill=mv.BRAND_CYAN, stroke=6)
+        txt(d, (1300, 770), f"WEEK OF {week_of.upper()}", 56, max_w=1000, stroke=5)
     img.resize((1280, 720), Image.LANCZOS).save(path)
 
 
@@ -539,7 +564,8 @@ def main():
     as_of = mv.as_of_text(updated, mv.TIMEZONE).replace("NWS data", "NWS forecasts")
     render(segs, durations, "recap_voice.wav", "recap.mp4", as_of)
     week_of = segs[0]["week_of"]
-    make_thumbnail(stories, week_of, "recap_thumb.png")
+    thumb_variant = choose_thumb_variant()
+    make_thumbnail(stories, week_of, "recap_thumb.png", thumb_variant)
     headline = stories[-1]["story"] if stories else "Hottest & Coldest Cities"
     title = f"Week in Weather: {headline} + the Week Ahead ({week_of})"[:100]
     story_lines = "\n".join(f"\u2022 {s['day']}: {s['story']} ({s['location']})" for s in stories) or "\u2022 A quiet week"
@@ -551,12 +577,17 @@ def main():
         print("Dry run: made recap.mp4 and recap_thumb.png without uploading")
         return
     vid = upload(title, desc, "recap.mp4", "recap_thumb.png")
-    is_new = not os.path.exists("weekly_log.csv")
-    with open("weekly_log.csv", "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["date", "video_id", "title"])
-        if is_new:
-            w.writeheader()
-        w.writerow({"date": datetime.now(timezone.utc).isoformat(timespec="minutes"), "video_id": vid, "title": title})
+    fields = ["date", "video_id", "title", "thumb_variant"]
+    rows = []
+    if os.path.exists("weekly_log.csv"):
+        with open("weekly_log.csv", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    rows.append({"date": datetime.now(timezone.utc).isoformat(timespec="minutes"), "video_id": vid,
+                "title": title, "thumb_variant": thumb_variant})
+    with open("weekly_log.csv", "w", newline="", encoding="utf-8") as f:   # rewriting keeps the columns up to date
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
 
 
 if __name__ == "__main__":
