@@ -16,8 +16,10 @@ FATIGUE_UNDERPERFORM = -0.15   # flagged as "underperforming" at this relative s
 FATIGUE_PENALTY = 0.85      # the multiplier applied in make_video.py when both conditions are met
 # ------------------------------
 
-from make_video import EXPERIMENTS as OPTIONS, CATEGORY_TAGS    # shared with the video maker
+from make_video import ALL_OPTIONS as OPTIONS, EXPERIMENTS as ACTIVE, CATEGORY_TAGS, REGIONS, MODEL_MIN_VIDEOS
 EXPERIMENTS = list(OPTIONS)
+COMMENT_EXPERIMENTS = {"cta"}   # judged by comments rather than views
+MODEL_SHRINK = 6        # how strongly the prediction model distrusts groups with few videos
 STORY_CATEGORIES = list(CATEGORY_TAGS)   # winter, tropical, heat, cold, flood, wind, fire, storm
 
 
@@ -56,7 +58,8 @@ def fetch_stats(ids):
         resp = yt.videos().list(part="statistics", id=",".join(ids[i:i + 50])).execute()
         for item in resp.get("items", []):
             s = item.get("statistics", {})
-            stats[item["id"]] = {"views": int(s.get("viewCount", 0)), "likes": int(s.get("likeCount", 0))}
+            stats[item["id"]] = {"views": int(s.get("viewCount", 0)), "likes": int(s.get("likeCount", 0)),
+                                 "comments": int(s.get("commentCount", 0))}
     return stats
 
 
@@ -76,13 +79,16 @@ def analyze(rows, stats, previous_best):
     def kind(v):
         return (v.get("format", ""), v.get("mode", ""), str(v.get("event", "")).lower() == "true")
 
-    by_kind, by_format = defaultdict(list), defaultdict(list)
+    by_kind, by_kind_c, by_format = defaultdict(list), defaultdict(list), defaultdict(list)
     for v in videos:
         v["score"] = math.log1p(v["views"])
+        v["comment_score"] = math.log1p(v.get("comments", 0))
         by_kind[kind(v)].append(v["score"])
+        by_kind_c[kind(v)].append(v["comment_score"])
         by_format[v.get("format", "")].append(v["score"])
     for v in videos:
         v["relative"] = v["score"] - statistics.mean(by_kind[kind(v)])
+        v["relative_c"] = v["comment_score"] - statistics.mean(by_kind_c[kind(v)])
 
     results, best = {}, dict(previous_best)
     for exp in EXPERIMENTS:
@@ -92,11 +98,13 @@ def analyze(rows, stats, previous_best):
                 continue          # the hook only applies when Gemini wrote the script
             if v.get(exp) in OPTIONS[exp]:         # ignores old rows that logged a fallback voice like "gtts"
                 groups[v[exp]].append(v)
+        metric = "relative_c" if exp in COMMENT_EXPERIMENTS else "relative"
         results[exp] = {opt: {"videos": len(vs),
                               "median_views": statistics.median(x["views"] for x in vs),
-                              "relative_score": round(statistics.mean(x["relative"] for x in vs), 3)}
+                              "median_comments": statistics.median(x.get("comments", 0) for x in vs),
+                              "relative_score": round(statistics.mean(x[metric] for x in vs), 3)}
                         for opt, vs in groups.items()}
-        ready = {o: r for o, r in results[exp].items() if r["videos"] >= MIN_SAMPLES}
+        ready = {o: r for o, r in results[exp].items() if r["videos"] >= MIN_SAMPLES and o in ACTIVE[exp]}
         if len(ready) >= 2:
             ranked = sorted(ready, key=lambda o: ready[o]["relative_score"], reverse=True)
             margin = ready[ranked[0]]["relative_score"] - ready[ranked[1]]["relative_score"]
@@ -143,6 +151,55 @@ def story_fatigue(rows, videos):
     return fatigue, status
 
 
+def region_of(state):
+    for region, states in REGIONS.items():
+        if state in states:
+            return region
+    return "other"
+
+
+def season_of(d):
+    return {12: "winter", 1: "winter", 2: "winter", 3: "spring", 4: "spring", 5: "spring",
+            6: "summer", 7: "summer", 8: "summer"}.get(d.month, "fall")
+
+
+def train_story_model(videos):
+    """Learns how much each story feature (category, region, season, morning/evening) moves views, as
+    additive effects on log-views. Groups with few videos are shrunk toward zero, so a couple of lucky
+    videos can't create a big effect. make_video.py ignores the model until it has MODEL_MIN_VIDEOS."""
+    data = []
+    for v in videos:
+        loc = v.get("location") or ""
+        if v.get("format") in STORY_CATEGORIES and ", " in loc:
+            d = parse_date(v.get("date", ""))
+            data.append(({"category": v["format"], "region": region_of(loc.rsplit(", ", 1)[1]),
+                          "season": season_of(d), "mode": v.get("mode", "")}, v["score"]))
+    if not data:
+        return {"n": 0, "global": 0.0, "effects": {}}
+    feats = ["category", "region", "season", "mode"]
+    mu = statistics.mean(y for _, y in data)
+    eff = {f: defaultdict(float) for f in feats}
+    for _ in range(8):                      # backfitting: refine each feature's effects given the others
+        for f in feats:
+            sums, counts = defaultdict(float), defaultdict(int)
+            for x, y in data:
+                others = sum(eff[g][x[g]] for g in feats if g != f)
+                sums[x[f]] += y - mu - others
+                counts[x[f]] += 1
+            eff[f] = defaultdict(float, {k: sums[k] / (counts[k] + MODEL_SHRINK) for k in sums})
+    return {"n": len(data), "global": round(mu, 4),
+            "effects": {f: {k: round(v, 4) for k, v in eff[f].items()} for f in feats}}
+
+
+def examples_for_analyst(videos, k=3):
+    """The best and worst judged videos (vs similar videos), with what they tested, for analyst.py."""
+    keep = ["title", "format", "mode", "hook", "title_style", "cta", "script", "views", "comments"]
+    ranked = sorted(videos, key=lambda v: v["relative"], reverse=True)
+    def pick(vs):
+        return [{f: v.get(f) for f in keep} for v in vs]
+    return {"best": pick(ranked[:k]), "worst": pick(ranked[-k:][::-1]) if len(ranked) > k else []}
+
+
 def analyze_weekly(rows, stats):
     """Same win-most-of-the-time test as the Shorts, applied to the two thumbnail layouts."""
     from weekly_recap import THUMB_VARIANTS
@@ -168,7 +225,8 @@ def analyze_weekly(rows, stats):
     return videos, results, best
 
 
-def write_report(videos, results, best, formats, total_logged, fatigue_status, weekly_results, weekly_best):
+def write_report(videos, results, best, formats, total_logged, fatigue_status, weekly_results, weekly_best,
+                 model=None):
     lines = ["# Weather bot performance report", "",
              f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. "
              f"{len(videos)} of {total_logged} logged videos are old enough to judge "
@@ -181,7 +239,8 @@ def write_report(videos, results, best, formats, total_logged, fatigue_status, w
               "|---|---|---|---|---|"]
     for exp in EXPERIMENTS:
         for opt, r in sorted(results.get(exp, {}).items()):
-            lines.append(f"| {exp} | {opt} | {r['videos']} | {r['median_views']:.0f} | {r['relative_score']:+.2f} |")
+            note = " (comments)" if exp in COMMENT_EXPERIMENTS else ""
+            lines.append(f"| {exp} | {opt} | {r['videos']} | {r['median_views']:.0f} | {r['relative_score']:+.2f}{note} |")
     lines += ["", "## Views by video type", "", "| Type | Videos | Median views |", "|---|---|---|"]
     for f, r in sorted(formats.items(), key=lambda x: -x[1]["median_views"]):
         lines.append(f"| {f or 'unknown'} | {r['videos']} | {r['median_views']:.0f} |")
@@ -208,6 +267,19 @@ def write_report(videos, results, best, formats, total_logged, fatigue_status, w
     for cat, s in sorted(fatigue_status.items(), key=lambda x: -x[1]["share"]):
         rel = f"{s['relative']:+.2f}" if s["relative"] is not None else "\u2014"
         lines.append(f"| {cat} | {s['share']:.0%} | {s['videos']} | {rel} | {'Yes' if s['flagged'] else ''} |")
+
+    lines += ["", "## Story prediction model", ""]
+    model = model or {}
+    if model.get("n", 0) >= MODEL_MIN_VIDEOS:
+        lines.append(f"Active: learned from {model['n']} story videos and now nudges story picks (up to \u00b115%).")
+    else:
+        lines.append(f"Learning: {model.get('n', 0)} of {MODEL_MIN_VIDEOS} story videos needed before it "
+                     "starts steering picks. Emergencies are never affected.")
+    effects = [(f, k, v) for f, d in model.get("effects", {}).items() for k, v in d.items()]
+    if effects:
+        lines += ["", "| Feature | Value | Effect on views |", "|---|---|---|"]
+        for f, k, v in sorted(effects, key=lambda e: -abs(e[2]))[:12]:
+            lines.append(f"| {f} | {k} | {math.expm1(v):+.0%} |")
 
     lines += ["", "## Weekly recap thumbnail test", ""]
     if weekly_results:
@@ -245,13 +317,15 @@ def main():
     if weekly_best is None:
         weekly_best = (previous.get("weekly_best") or {}).get("thumb_variant")
 
+    model = train_story_model(videos)
     settings = {"updated": datetime.now(timezone.utc).isoformat(timespec="minutes"),
                 "explore_rate": EXPLORE_RATE, "best": best, "results": results,
                 "videos_judged": len(videos), "story_fatigue": fatigue,
-                "weekly_best": {"thumb_variant": weekly_best} if weekly_best else {}}
+                "weekly_best": {"thumb_variant": weekly_best} if weekly_best else {},
+                "story_model": model, "examples": examples_for_analyst(videos)}
     with open("learned_settings.json", "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
-    write_report(videos, results, best, formats, len(rows), fatigue_status, weekly_results, weekly_best)
+    write_report(videos, results, best, formats, len(rows), fatigue_status, weekly_results, weekly_best, model)
     print(f"Judged {len(videos)} Shorts of {len(rows)} logged, {len(weekly_videos)} weekly of {len(weekly_rows)} logged.")
     print(f"Winners: {best or 'none yet'} | Fatigued categories: {list(fatigue) or 'none'} | "
           f"Thumbnail: {weekly_best or 'still testing'}")
