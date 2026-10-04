@@ -513,7 +513,7 @@ def upload(title, desc, path, thumb):
     yt = build("youtube", "v3", credentials=creds)
     body = {"snippet": {"title": title, "description": desc, "categoryId": "25",
                         "tags": ["weather", "weather forecast", "week ahead", "AtmosSquall", "severe weather"]},
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}}
+            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False, "containsSyntheticMedia": True}}
     res = yt.videos().insert(part="snippet,status", body=body,
                              media_body=MediaFileUpload(path, mimetype="video/mp4", resumable=True)).execute()
     vid = res["id"]
