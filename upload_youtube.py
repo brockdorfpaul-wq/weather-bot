@@ -10,7 +10,7 @@ creds = Credentials(None, refresh_token=os.environ["YT_REFRESH_TOKEN"],
 yt = build("youtube", "v3", credentials=creds)
 title, desc = open("caption.txt", encoding="utf-8").read().split("\n", 1)
 body = {"snippet": {"title": title[:95], "description": desc, "categoryId": "25"},
-        "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}}
+        "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False, "containsSyntheticMedia": True}}
 res = yt.videos().insert(part="snippet,status", body=body,
         media_body=MediaFileUpload("out.mp4", mimetype="video/mp4", resumable=True)).execute()
 video_id = res["id"]
