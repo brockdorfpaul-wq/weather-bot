@@ -185,9 +185,12 @@ def build_segments():
                 (f"The best chance of {wet[0]['kind'].lower()} comes {on_day(wet[0]['name'])}, at {wet[0]['pop']} percent."
                  if wet else "It looks mostly dry, with no day above a 50 percent chance of rain or snow."))
         segs.append({"id": f"city_{name}", "kind": "city", "city": cw, "facts": facts, "template": tmpl})
-    segs.append({"id": "outro", "kind": "outro", "facts": "Closing: ask viewers to subscribe to AtmosSquall for daily forecasts.",
-                 "template": ("That's your week in weather. Subscribe to AtmosSquall for daily forecasts, "
-                              "and check weather.gov for the latest alerts where you live. See you next week.")})
+    segs.append({"id": "outro", "kind": "outro",
+                 "facts": ("Closing: ask viewers to comment with what weather they want covered next week, "
+                           "and to subscribe to AtmosSquall for daily forecasts."),
+                 "template": ("That's your week in weather. What should we cover next week? Tell us in the comments. "
+                              "Subscribe to AtmosSquall for daily forecasts, and check weather.gov for the latest "
+                              "alerts where you live. See you next week.")})
     return segs, stories, updated
 
 
@@ -548,6 +551,12 @@ def upload(title, desc, path, thumb):
         print("Thumbnail set")
     except Exception as e:
         print("Could not set the thumbnail (is the channel phone-verified?):", e)
+    try:                                            # start the conversation with the first comment
+        yt.commentThreads().insert(part="snippet", body={"snippet": {"videoId": vid, "topLevelComment": {
+            "snippet": {"textOriginal": "What weather should AtmosSquall cover next week? Tell us in the comments."}}}}).execute()
+        print("Posted the first comment")
+    except Exception as e:
+        print("Could not post the first comment (does the token include the comment permission?):", e)
     return vid
 
 
